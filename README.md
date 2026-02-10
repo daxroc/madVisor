@@ -1,5 +1,7 @@
 # madVisor
 
+![madVisor screenshot](img/screenshot.png)
+
 [![GitHub](https://img.shields.io/badge/github-daxroc/madVisor-blue)](https://github.com/daxroc/madVisor)
 
 A real-time terminal dashboard that visualizes Prometheus metrics from containers in a Kubernetes pod. Runs as a sidecar or ephemeral debug container — only active when a TTY is attached, near-zero overhead otherwise.
