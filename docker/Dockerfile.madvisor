@@ -11,7 +11,9 @@ RUN CGO_ENABLED=0 go build \
     -o /madvisor ./cmd/madvisor/
 
 FROM alpine:3.19
-RUN apk add --no-cache ncurses
+RUN apk add --no-cache ncurses && \
+    addgroup -g 10001 -S madvisor && adduser -u 10001 -S madvisor -G madvisor
 COPY --from=builder /madvisor /madvisor
+USER 10001:10001
 ENV TERM=xterm-256color
 ENTRYPOINT ["/madvisor"]
