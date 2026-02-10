@@ -1,0 +1,71 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  govulncheck:
+    name: Go Vulnerability Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+
+  trivy:
+    name: Container Image Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: |
+          VERSION=$(cat VERSION)
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          GIT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "unknown")
+
+          docker build -f docker/Dockerfile.madvisor \
+            --build-arg VERSION=$VERSION \
+            --build-arg GIT_COMMIT=$GIT_COMMIT \
+            --build-arg GIT_BRANCH=$GIT_BRANCH \
+            -t madvisor:scan .
+
+          docker build -f docker/Dockerfile.madvisor-dummy \
+            --build-arg VERSION=$VERSION \
+            --build-arg GIT_COMMIT=$GIT_COMMIT \
+            --build-arg GIT_BRANCH=$GIT_BRANCH \
+            -t madvisor-dummy:scan .
+
+      - name: Trivy scan — madvisor
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: madvisor:scan
+          format: sarif
+          output: trivy-madvisor.sarif
+
+      - name: Trivy scan — madvisor-dummy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: madvisor-dummy:scan
+          format: sarif
+          output: trivy-dummy.sarif
+
+      - name: Upload SARIF — madvisor
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-madvisor.sarif
+          category: trivy-madvisor
+
+      - name: Upload SARIF — madvisor-dummy
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-dummy.sarif
+          category: trivy-madvisor-dummy
