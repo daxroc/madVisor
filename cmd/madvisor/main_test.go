@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- metricSeries tests ---
@@ -17,6 +19,7 @@ func newTestSeries(name string, labels map[string]string) *metricSeries {
 		name:   name,
 		labels: labels,
 		values: make([]float64, ringSize),
+		times:  make([]time.Time, ringSize),
 	}
 }
 
@@ -329,7 +332,7 @@ func TestUIStateSetKeys(t *testing.T) {
 	u := &uiState{}
 	u.setKeys([]string{"a", "b", "c"})
 
-	filtered, selIdx, _, _ := u.snapshot()
+	filtered, selIdx, _, _, _ := u.snapshot()
 	if len(filtered) != 3 {
 		t.Fatalf("filtered len = %d, want 3", len(filtered))
 	}
@@ -381,7 +384,7 @@ func TestUIStateFilter(t *testing.T) {
 	u.addFilterChar('p')
 	u.addFilterChar('u')
 
-	filtered, _, filter, fm := u.snapshot()
+	filtered, _, _, filter, fm := u.snapshot()
 	if filter != "cpu" {
 		t.Errorf("filter = %q, want cpu", filter)
 	}
@@ -402,7 +405,7 @@ func TestUIStateFilterCaseInsensitive(t *testing.T) {
 	u.addFilterChar('p')
 	u.addFilterChar('u')
 
-	filtered, _, _, _ := u.snapshot()
+	filtered, _, _, _, _ := u.snapshot()
 	if len(filtered) != 1 {
 		t.Errorf("filtered len = %d, want 1 (case insensitive)", len(filtered))
 	}
@@ -416,13 +419,13 @@ func TestUIStateBackspaceFilter(t *testing.T) {
 	u.addFilterChar('a')
 	u.addFilterChar('b')
 
-	filtered, _, _, _ := u.snapshot()
+	filtered, _, _, _, _ := u.snapshot()
 	if len(filtered) != 1 {
 		t.Fatalf("after 'ab': filtered = %d, want 1", len(filtered))
 	}
 
 	u.backspaceFilter()
-	filtered, _, filter, _ := u.snapshot()
+	filtered, _, _, filter, _ := u.snapshot()
 	if filter != "a" {
 		t.Errorf("after backspace: filter = %q, want a", filter)
 	}
@@ -439,7 +442,7 @@ func TestUIStateClearFilter(t *testing.T) {
 	u.addFilterChar('a')
 	u.clearFilter()
 
-	filtered, _, filter, fm := u.snapshot()
+	filtered, _, _, filter, fm := u.snapshot()
 	if filter != "" {
 		t.Errorf("after clear: filter = %q, want empty", filter)
 	}
@@ -464,9 +467,74 @@ func TestUIStateFilterClampsSelection(t *testing.T) {
 	u.startFilter()
 	u.addFilterChar('a')
 
-	_, selIdx, _, _ := u.snapshot()
+	_, selIdx, _, _, _ := u.snapshot()
 	if selIdx != 0 {
 		t.Errorf("selIdx should clamp to 0 when filter shrinks list, got %d", selIdx)
+	}
+}
+
+func TestUIStateScrollOffset(t *testing.T) {
+	u := &uiState{pageSize: 5}
+	keys := make([]string, 20)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("metric_%02d", i)
+	}
+	u.setKeys(keys)
+
+	_, _, scrollOff, _, _ := u.snapshot()
+	if scrollOff != 0 {
+		t.Errorf("initial scrollOff = %d, want 0", scrollOff)
+	}
+
+	for i := 0; i < 7; i++ {
+		u.moveDown()
+	}
+	_, selIdx, scrollOff, _, _ := u.snapshot()
+	if selIdx != 7 {
+		t.Errorf("selIdx = %d, want 7", selIdx)
+	}
+	if scrollOff != 3 {
+		t.Errorf("scrollOff = %d, want 3 (selIdx 7 - pageSize 5 + 1)", scrollOff)
+	}
+
+	for i := 0; i < 7; i++ {
+		u.moveUp()
+	}
+	_, selIdx, scrollOff, _, _ = u.snapshot()
+	if selIdx != 0 {
+		t.Errorf("selIdx after moveUp = %d, want 0", selIdx)
+	}
+	if scrollOff != 0 {
+		t.Errorf("scrollOff after moveUp = %d, want 0", scrollOff)
+	}
+}
+
+func TestUIStateScrollResetOnFilter(t *testing.T) {
+	u := &uiState{pageSize: 3}
+	keys := make([]string, 10)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("metric_%02d", i)
+	}
+	u.setKeys(keys)
+
+	for i := 0; i < 8; i++ {
+		u.moveDown()
+	}
+	_, _, scrollOff, _, _ := u.snapshot()
+	if scrollOff == 0 {
+		t.Fatal("scrollOff should be non-zero after navigating down")
+	}
+
+	u.startFilter()
+	u.addFilterChar('0')
+	u.addFilterChar('1')
+
+	_, selIdx, scrollOff, _, _ := u.snapshot()
+	if selIdx != 0 {
+		t.Errorf("selIdx after filter = %d, want 0", selIdx)
+	}
+	if scrollOff != 0 {
+		t.Errorf("scrollOff after filter = %d, want 0", scrollOff)
 	}
 }
 
@@ -540,6 +608,402 @@ cpu_usage 50.0
 	}
 	if bare.last() != 50.0 {
 		t.Errorf("cpu_usage value = %f, want 50.0", bare.last())
+	}
+}
+
+// --- formatValue tests ---
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		val  float64
+		want string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1024, "1.00 KiB"},
+		{1536, "1.50 KiB"},
+		{1048576, "1.00 MiB"},
+		{1073741824, "1.00 GiB"},
+		{1099511627776, "1.00 TiB"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := formatBytes(tt.val); got != tt.want {
+				t.Errorf("formatBytes(%f) = %q, want %q", tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatDuration(t *testing.T) {
+	tests := []struct {
+		sec  float64
+		want string
+	}{
+		{0.0000001, "100ns"},
+		{0.00035, "350.0µs"},
+		{0.045, "45.0ms"},
+		{1.5, "1.50s"},
+		{90, "1.5m"},
+		{5400, "1.5h"},
+		{172800, "2.0d"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := formatDuration(tt.sec); got != tt.want {
+				t.Errorf("formatDuration(%f) = %q, want %q", tt.sec, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatCount(t *testing.T) {
+	tests := []struct {
+		val  float64
+		want string
+	}{
+		{0, "0"},
+		{42, "42"},
+		{999, "999"},
+		{1500, "1.50k"},
+		{2500000, "2.50M"},
+		{3500000000, "3.50G"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := formatCount(tt.val); got != tt.want {
+				t.Errorf("formatCount(%f) = %q, want %q", tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatGeneric(t *testing.T) {
+	tests := []struct {
+		val  float64
+		want string
+	}{
+		{0, "0"},
+		{0.005, "0.0050"},
+		{0.15, "0.150"},
+		{42.5, "42.50"},
+		{1500, "1.50k"},
+		{2500000, "2.50M"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := formatGeneric(tt.val); got != tt.want {
+				t.Errorf("formatGeneric(%f) = %q, want %q", tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatValueDispatch(t *testing.T) {
+	tests := []struct {
+		name string
+		val  float64
+		want string
+	}{
+		{"memory_usage_bytes", 1048576, "1.00 MiB"},
+		{"memory_usage_megabytes", 256, "256.00 MiB"},
+		{"memory_usage_kilobytes", 1024, "1.00 MiB"},
+		{"request_duration_seconds", 0.045, "45.0ms"},
+		{"request_duration_milliseconds", 45, "45.0ms"},
+		{"request_duration_ms", 45, "45.0ms"},
+		{"cpu_usage_percent", 65.3, "65.3%"},
+		{"http_requests_total", 1500, "1.50k"},
+		{"active_connections", 42.5, "42.50"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatValue(tt.name, tt.val); got != tt.want {
+				t.Errorf("formatValue(%q, %f) = %q, want %q", tt.name, tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestYAxisFormatter(t *testing.T) {
+	f := yAxisFormatter("memory_usage_bytes")
+	if got := f(1048576); got != "1.00 MiB" {
+		t.Errorf("yAxisFormatter bytes(1048576) = %q, want '1.00 MiB'", got)
+	}
+
+	f2 := yAxisFormatter("request_duration_seconds")
+	if got := f2(0.045); got != "45.0ms" {
+		t.Errorf("yAxisFormatter seconds(0.045) = %q, want '45.0ms'", got)
+	}
+}
+
+func TestYAxisFormatterNaN(t *testing.T) {
+	f := yAxisFormatter("cpu_bytes")
+	if got := f(math.NaN()); got != "" {
+		t.Errorf("yAxisFormatter(NaN) = %q, want empty", got)
+	}
+}
+
+func TestUnitSuffix(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"memory_usage_bytes", " [bytes]"},
+		{"memory_usage_megabytes", " [bytes]"},
+		{"memory_usage_kilobytes", " [bytes]"},
+		{"request_duration_seconds", " [duration]"},
+		{"request_duration_milliseconds", " [duration]"},
+		{"latency_ms", " [duration]"},
+		{"cpu_usage_percent", " [%]"},
+		{"http_requests_total", " [count]"},
+		{"active_connections", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := unitSuffix(tt.name); got != tt.want {
+				t.Errorf("unitSuffix(%q) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- rate tests ---
+
+func TestIsCounter(t *testing.T) {
+	tests := []struct {
+		name  string
+		mtype string
+		want  bool
+	}{
+		{"http_requests_total", "counter", true},
+		{"http_requests_total", "gauge", true},
+		{"http_requests_total", "", true},
+		{"some_metric", "counter", true},
+		{"some_metric", "gauge", false},
+		{"memory_bytes", "", false},
+	}
+	for _, tt := range tests {
+		s := &metricSeries{name: tt.name, mtype: tt.mtype, values: make([]float64, ringSize), times: make([]time.Time, ringSize)}
+		if got := s.isCounter(); got != tt.want {
+			t.Errorf("isCounter(name=%q, mtype=%q) = %v, want %v", tt.name, tt.mtype, got, tt.want)
+		}
+	}
+}
+
+func TestCount(t *testing.T) {
+	s := newTestSeries("test", nil)
+	if s.count() != 0 {
+		t.Errorf("count on empty = %d, want 0", s.count())
+	}
+	s.push(1)
+	s.push(2)
+	if s.count() != 2 {
+		t.Errorf("count after 2 pushes = %d, want 2", s.count())
+	}
+}
+
+func TestRateBasic(t *testing.T) {
+	s := &metricSeries{
+		name:   "http_requests_total",
+		mtype:  "counter",
+		values: make([]float64, ringSize),
+		times:  make([]time.Time, ringSize),
+	}
+
+	base := time.Now()
+	s.pushAt(100, base)
+	s.pushAt(110, base.Add(1*time.Second))
+	s.pushAt(120, base.Add(2*time.Second))
+	s.pushAt(130, base.Add(3*time.Second))
+	s.pushAt(140, base.Add(4*time.Second))
+	s.pushAt(150, base.Add(5*time.Second))
+
+	r := s.rate(5 * time.Second)
+	if r < 9.9 || r > 10.1 {
+		t.Errorf("rate(5s) = %f, want ~10.0", r)
+	}
+}
+
+func TestRateShortWindow(t *testing.T) {
+	s := &metricSeries{
+		name:   "req_total",
+		mtype:  "counter",
+		values: make([]float64, ringSize),
+		times:  make([]time.Time, ringSize),
+	}
+
+	base := time.Now()
+	s.pushAt(0, base)
+	s.pushAt(10, base.Add(1*time.Second))
+	s.pushAt(20, base.Add(2*time.Second))
+	s.pushAt(50, base.Add(3*time.Second))
+
+	r := s.rate(2 * time.Second)
+	if r < 19.9 || r > 20.1 {
+		t.Errorf("rate(2s) = %f, want ~20.0 (last 2s: 20→50)", r)
+	}
+}
+
+func TestRateSingleSample(t *testing.T) {
+	s := newTestSeries("counter_total", nil)
+	s.pushAt(100, time.Now())
+
+	if r := s.rate(5 * time.Second); r != 0 {
+		t.Errorf("rate with 1 sample = %f, want 0", r)
+	}
+}
+
+func TestRateCounterReset(t *testing.T) {
+	s := &metricSeries{
+		name:   "req_total",
+		mtype:  "counter",
+		values: make([]float64, ringSize),
+		times:  make([]time.Time, ringSize),
+	}
+
+	base := time.Now()
+	s.pushAt(100, base)
+	s.pushAt(50, base.Add(1*time.Second))
+
+	r := s.rate(5 * time.Second)
+	if r != 0 {
+		t.Errorf("rate on counter reset = %f, want 0 (negative delta clamped)", r)
+	}
+}
+
+func TestRateSlice(t *testing.T) {
+	s := &metricSeries{
+		name:   "req_total",
+		mtype:  "counter",
+		values: make([]float64, ringSize),
+		times:  make([]time.Time, ringSize),
+	}
+
+	base := time.Now()
+	s.pushAt(0, base)
+	s.pushAt(10, base.Add(1*time.Second))
+	s.pushAt(30, base.Add(2*time.Second))
+	s.pushAt(60, base.Add(3*time.Second))
+
+	rates := s.rateSlice(5 * time.Second)
+	if len(rates) != 3 {
+		t.Fatalf("rateSlice len = %d, want 3", len(rates))
+	}
+
+	expected := []float64{10, 20, 30}
+	for i, want := range expected {
+		if rates[i] < want-0.1 || rates[i] > want+0.1 {
+			t.Errorf("rateSlice[%d] = %f, want ~%f", i, rates[i], want)
+		}
+	}
+}
+
+func TestRateSliceTooFew(t *testing.T) {
+	s := newTestSeries("x_total", nil)
+	s.pushAt(100, time.Now())
+	if rates := s.rateSlice(5 * time.Second); rates != nil {
+		t.Errorf("rateSlice with 1 sample = %v, want nil", rates)
+	}
+}
+
+func TestRateSliceCounterReset(t *testing.T) {
+	s := &metricSeries{
+		name:   "req_total",
+		mtype:  "counter",
+		values: make([]float64, ringSize),
+		times:  make([]time.Time, ringSize),
+	}
+
+	base := time.Now()
+	s.pushAt(100, base)
+	s.pushAt(50, base.Add(1*time.Second))
+	s.pushAt(60, base.Add(2*time.Second))
+
+	rates := s.rateSlice(5 * time.Second)
+	if len(rates) != 2 {
+		t.Fatalf("rateSlice len = %d, want 2", len(rates))
+	}
+	if rates[0] != 0 {
+		t.Errorf("rateSlice[0] on reset = %f, want 0", rates[0])
+	}
+	if rates[1] < 9.9 || rates[1] > 10.1 {
+		t.Errorf("rateSlice[1] after reset = %f, want ~10", rates[1])
+	}
+}
+
+func TestRateAxisFormatter(t *testing.T) {
+	f := rateAxisFormatter()
+	if got := f(42.5); got != "42.50/s" {
+		t.Errorf("rateAxisFormatter(42.5) = %q, want '42.50/s'", got)
+	}
+	if got := f(math.NaN()); got != "" {
+		t.Errorf("rateAxisFormatter(NaN) = %q, want empty", got)
+	}
+}
+
+func TestRateWindowUpDown(t *testing.T) {
+	rateWindowSet(5 * time.Second)
+	defer rateWindowSet(defaultRateWindow)
+
+	if got := rateWindowGet(); got != 5*time.Second {
+		t.Fatalf("initial rateWindow = %s, want 5s", got)
+	}
+
+	got := rateWindowUp()
+	if got != 10*time.Second {
+		t.Errorf("rateWindowUp from 5s = %s, want 10s", got)
+	}
+	if rateWindowGet() != 10*time.Second {
+		t.Errorf("rateWindowGet after Up = %s, want 10s", rateWindowGet())
+	}
+
+	got = rateWindowDown()
+	if got != 5*time.Second {
+		t.Errorf("rateWindowDown from 10s = %s, want 5s", got)
+	}
+
+	rateWindowSet(1 * time.Second)
+	got = rateWindowDown()
+	if got != 1*time.Second {
+		t.Errorf("rateWindowDown at min = %s, want 1s (clamped)", got)
+	}
+
+	rateWindowSet(60 * time.Second)
+	got = rateWindowUp()
+	if got != 60*time.Second {
+		t.Errorf("rateWindowUp at max = %s, want 60s (clamped)", got)
+	}
+}
+
+func TestRateWindowSetSnaps(t *testing.T) {
+	defer rateWindowSet(defaultRateWindow)
+
+	rateWindowSet(3 * time.Second)
+	if got := rateWindowGet(); got != 5*time.Second {
+		t.Errorf("rateWindowSet(3s) snapped to %s, want 5s", got)
+	}
+
+	rateWindowSet(100 * time.Second)
+	if got := rateWindowGet(); got != 60*time.Second {
+		t.Errorf("rateWindowSet(100s) snapped to %s, want 60s", got)
+	}
+}
+
+func TestParseRateWindow(t *testing.T) {
+	defer rateWindowSet(defaultRateWindow)
+
+	os.Setenv("RATE_WINDOW", "10s")
+	defer os.Unsetenv("RATE_WINDOW")
+	parseRateWindow()
+	if got := rateWindowGet(); got != 10*time.Second {
+		t.Errorf("rateWindow = %s, want 10s", got)
+	}
+
+	os.Setenv("RATE_WINDOW", "invalid")
+	rateWindowSet(defaultRateWindow)
+	parseRateWindow()
+	if got := rateWindowGet(); got != defaultRateWindow {
+		t.Errorf("rateWindow = %s, want default %s on invalid input", got, defaultRateWindow)
 	}
 }
 

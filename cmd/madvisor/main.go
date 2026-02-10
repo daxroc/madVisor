@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -33,10 +34,64 @@ var (
 )
 
 const (
-	ringSize        = 120
-	scrapeInterval  = 1 * time.Second
-	refreshInterval = 250 * time.Millisecond
+	ringSize         = 120
+	scrapeInterval   = 1 * time.Second
+	refreshInterval  = 250 * time.Millisecond
+	defaultRateWindow = 5 * time.Second
 )
+
+var rateWindowSteps = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
+type rateWindowState struct {
+	mu  sync.Mutex
+	idx int
+}
+
+var rws = rateWindowState{idx: 2}
+
+func rateWindowGet() time.Duration {
+	rws.mu.Lock()
+	defer rws.mu.Unlock()
+	return rateWindowSteps[rws.idx]
+}
+
+func rateWindowUp() time.Duration {
+	rws.mu.Lock()
+	defer rws.mu.Unlock()
+	if rws.idx < len(rateWindowSteps)-1 {
+		rws.idx++
+	}
+	return rateWindowSteps[rws.idx]
+}
+
+func rateWindowDown() time.Duration {
+	rws.mu.Lock()
+	defer rws.mu.Unlock()
+	if rws.idx > 0 {
+		rws.idx--
+	}
+	return rateWindowSteps[rws.idx]
+}
+
+func rateWindowSet(d time.Duration) {
+	rws.mu.Lock()
+	defer rws.mu.Unlock()
+	for i, s := range rateWindowSteps {
+		if s >= d {
+			rws.idx = i
+			return
+		}
+	}
+	rws.idx = len(rateWindowSteps) - 1
+}
 
 const logo = `
                         ██╗   ██╗██╗███████╗ ██████╗ ██████╗
@@ -59,16 +114,115 @@ type metricSeries struct {
 	help   string
 	mtype  string
 	values []float64
+	times  []time.Time
 	idx    int
 	full   bool
 }
 
 func (s *metricSeries) push(v float64) {
+	now := time.Now()
 	s.values[s.idx] = v
+	s.times[s.idx] = now
 	s.idx = (s.idx + 1) % ringSize
 	if s.idx == 0 {
 		s.full = true
 	}
+}
+
+func (s *metricSeries) pushAt(v float64, t time.Time) {
+	s.values[s.idx] = v
+	s.times[s.idx] = t
+	s.idx = (s.idx + 1) % ringSize
+	if s.idx == 0 {
+		s.full = true
+	}
+}
+
+func (s *metricSeries) isCounter() bool {
+	return s.mtype == "counter" || strings.HasSuffix(s.name, "_total")
+}
+
+func (s *metricSeries) rate(window time.Duration) float64 {
+	n := s.count()
+	if n < 2 {
+		return 0
+	}
+
+	newestIdx := s.idx - 1
+	if newestIdx < 0 {
+		newestIdx = ringSize - 1
+	}
+	newest := s.values[newestIdx]
+	newestT := s.times[newestIdx]
+	cutoff := newestT.Add(-window)
+
+	oldestIdx := newestIdx
+	oldestVal := newest
+	oldestT := newestT
+
+	for j := 1; j < n; j++ {
+		i := newestIdx - j
+		if i < 0 {
+			i += ringSize
+		}
+		if s.times[i].Before(cutoff) {
+			break
+		}
+		oldestIdx = i
+		oldestVal = s.values[i]
+		oldestT = s.times[i]
+	}
+	_ = oldestIdx
+
+	elapsed := newestT.Sub(oldestT).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	delta := newest - oldestVal
+	if delta < 0 {
+		return 0
+	}
+	return delta / elapsed
+}
+
+func (s *metricSeries) count() int {
+	if s.full {
+		return ringSize
+	}
+	return s.idx
+}
+
+func (s *metricSeries) rateSlice(window time.Duration) []float64 {
+	n := s.count()
+	if n < 2 {
+		return nil
+	}
+
+	start := 0
+	if s.full {
+		start = s.idx
+	}
+
+	rates := make([]float64, 0, n-1)
+	prevVal := s.values[start%ringSize]
+	prevT := s.times[start%ringSize]
+
+	for j := 1; j < n; j++ {
+		i := (start + j) % ringSize
+		dt := s.times[i].Sub(prevT).Seconds()
+		var r float64
+		if dt > 0 {
+			delta := s.values[i] - prevVal
+			if delta < 0 {
+				delta = 0
+			}
+			r = delta / dt
+		}
+		rates = append(rates, r)
+		prevVal = s.values[i]
+		prevT = s.times[i]
+	}
+	return rates
 }
 
 func (s *metricSeries) slice() []float64 {
@@ -106,6 +260,135 @@ func (s *metricSeries) displayName() string {
 		parts = append(parts, fmt.Sprintf(`%s="%s"`, k, s.labels[k]))
 	}
 	return s.name + "{" + strings.Join(parts, ",") + "}"
+}
+
+// --- value formatting ---
+
+func formatValue(name string, v float64) string {
+	switch {
+	case strings.HasSuffix(name, "_bytes"):
+		return formatBytes(v)
+	case strings.HasSuffix(name, "_megabytes"):
+		return formatBytes(v * 1024 * 1024)
+	case strings.HasSuffix(name, "_kilobytes"):
+		return formatBytes(v * 1024)
+	case strings.HasSuffix(name, "_seconds"):
+		return formatDuration(v)
+	case strings.HasSuffix(name, "_milliseconds") || strings.HasSuffix(name, "_ms"):
+		return formatDuration(v / 1000)
+	case strings.HasSuffix(name, "_percent"):
+		return fmt.Sprintf("%.1f%%", v)
+	case strings.HasSuffix(name, "_total"):
+		return formatCount(v)
+	default:
+		return formatGeneric(v)
+	}
+}
+
+func formatBytes(b float64) string {
+	switch {
+	case b >= 1<<40:
+		return fmt.Sprintf("%.2f TiB", b/(1<<40))
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GiB", b/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.2f MiB", b/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.2f KiB", b/(1<<10))
+	default:
+		return fmt.Sprintf("%.0f B", b)
+	}
+}
+
+func formatDuration(sec float64) string {
+	switch {
+	case sec >= 86400:
+		return fmt.Sprintf("%.1fd", sec/86400)
+	case sec >= 3600:
+		return fmt.Sprintf("%.1fh", sec/3600)
+	case sec >= 60:
+		return fmt.Sprintf("%.1fm", sec/60)
+	case sec >= 1:
+		return fmt.Sprintf("%.2fs", sec)
+	case sec >= 0.001:
+		return fmt.Sprintf("%.1fms", sec*1000)
+	case sec >= 0.000001:
+		return fmt.Sprintf("%.1fµs", sec*1e6)
+	default:
+		return fmt.Sprintf("%.0fns", sec*1e9)
+	}
+}
+
+func formatCount(v float64) string {
+	switch {
+	case v >= 1e9:
+		return fmt.Sprintf("%.2fG", v/1e9)
+	case v >= 1e6:
+		return fmt.Sprintf("%.2fM", v/1e6)
+	case v >= 1e3:
+		return fmt.Sprintf("%.2fk", v/1e3)
+	default:
+		return fmt.Sprintf("%.0f", v)
+	}
+}
+
+func formatGeneric(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	abs := v
+	if abs < 0 {
+		abs = -abs
+	}
+	switch {
+	case abs >= 1e6:
+		return fmt.Sprintf("%.2fM", v/1e6)
+	case abs >= 1e3:
+		return fmt.Sprintf("%.2fk", v/1e3)
+	case abs >= 1:
+		return fmt.Sprintf("%.2f", v)
+	case abs >= 0.01:
+		return fmt.Sprintf("%.3f", v)
+	default:
+		return fmt.Sprintf("%.4f", v)
+	}
+}
+
+func rateAxisFormatter() linechart.ValueFormatter {
+	return func(v float64) string {
+		if math.IsNaN(v) {
+			return ""
+		}
+		return formatGeneric(v) + "/s"
+	}
+}
+
+func yAxisFormatter(metricName string) linechart.ValueFormatter {
+	return func(v float64) string {
+		if math.IsNaN(v) {
+			return ""
+		}
+		return formatValue(metricName, v)
+	}
+}
+
+func unitSuffix(name string) string {
+	switch {
+	case strings.HasSuffix(name, "_bytes"),
+		strings.HasSuffix(name, "_megabytes"),
+		strings.HasSuffix(name, "_kilobytes"):
+		return " [bytes]"
+	case strings.HasSuffix(name, "_seconds"):
+		return " [duration]"
+	case strings.HasSuffix(name, "_milliseconds") || strings.HasSuffix(name, "_ms"):
+		return " [duration]"
+	case strings.HasSuffix(name, "_percent"):
+		return " [%]"
+	case strings.HasSuffix(name, "_total"):
+		return " [count]"
+	default:
+		return ""
+	}
 }
 
 // --- store ---
@@ -149,6 +432,7 @@ func (st *store) update(name string, labels map[string]string, help, mtype strin
 			help:   help,
 			mtype:  mtype,
 			values: make([]float64, ringSize),
+			times:  make([]time.Time, ringSize),
 		}
 		st.series[key] = s
 		st.order = append(st.order, key)
@@ -294,13 +578,17 @@ func waitForTTY() {
 
 // --- UI state ---
 
+const defaultPageSize = 30
+
 type uiState struct {
-	mu          sync.Mutex
-	allKeys     []string
-	filtered    []string
-	selectedIdx int
-	filterText  string
-	filterMode  bool
+	mu           sync.Mutex
+	allKeys      []string
+	filtered     []string
+	selectedIdx  int
+	scrollOffset int
+	pageSize     int
+	filterText   string
+	filterMode   bool
 }
 
 func (u *uiState) setKeys(keys []string) {
@@ -328,6 +616,23 @@ func (u *uiState) applyFilter() {
 	if u.selectedIdx < 0 {
 		u.selectedIdx = 0
 	}
+	u.adjustScroll()
+}
+
+func (u *uiState) adjustScroll() {
+	ps := u.pageSize
+	if ps <= 0 {
+		ps = defaultPageSize
+	}
+	if u.selectedIdx < u.scrollOffset {
+		u.scrollOffset = u.selectedIdx
+	}
+	if u.selectedIdx >= u.scrollOffset+ps {
+		u.scrollOffset = u.selectedIdx - ps + 1
+	}
+	if u.scrollOffset < 0 {
+		u.scrollOffset = 0
+	}
 }
 
 func (u *uiState) moveUp() {
@@ -335,6 +640,7 @@ func (u *uiState) moveUp() {
 	defer u.mu.Unlock()
 	if u.selectedIdx > 0 {
 		u.selectedIdx--
+		u.adjustScroll()
 	}
 }
 
@@ -343,6 +649,7 @@ func (u *uiState) moveDown() {
 	defer u.mu.Unlock()
 	if u.selectedIdx < len(u.filtered)-1 {
 		u.selectedIdx++
+		u.adjustScroll()
 	}
 }
 
@@ -385,10 +692,10 @@ func (u *uiState) startFilter() {
 	u.filterMode = true
 }
 
-func (u *uiState) snapshot() (filtered []string, selIdx int, filter string, filterMode bool) {
+func (u *uiState) snapshot() (filtered []string, selIdx int, scrollOff int, filter string, filterMode bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	return append([]string{}, u.filtered...), u.selectedIdx, u.filterText, u.filterMode
+	return append([]string{}, u.filtered...), u.selectedIdx, u.scrollOffset, u.filterText, u.filterMode
 }
 
 // --- colors ---
@@ -432,7 +739,7 @@ func buildSplashGrid(logoWidget *text.Text, statusWidget *text.Text) ([]containe
 
 // --- render metric list ---
 
-func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, filter string, filterMode bool) {
+func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, scrollOff int, filter string, filterMode bool) {
 	w.Reset()
 
 	if filterMode || filter != "" {
@@ -442,8 +749,17 @@ func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, fi
 		w.Write("\n")
 	}
 
-	for i, key := range filtered {
-		s := st.get(key)
+	if scrollOff > 0 {
+		w.Write(fmt.Sprintf("  ↑ %d more\n", scrollOff), text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
+	}
+
+	end := len(filtered)
+	if end > scrollOff+defaultPageSize {
+		end = scrollOff + defaultPageSize
+	}
+
+	for i := scrollOff; i < end; i++ {
+		s := st.get(filtered[i])
 		if s == nil {
 			continue
 		}
@@ -455,11 +771,21 @@ func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, fi
 		}
 
 		display := s.displayName()
-		valStr := fmt.Sprintf(" = %.2f", s.last())
+		var valStr string
+		if s.isCounter() {
+			r := s.rate(rateWindowGet())
+			valStr = " = " + formatGeneric(r) + "/s"
+		} else {
+			valStr = " = " + formatValue(s.name, s.last())
+		}
 
 		w.Write(prefix, text.WriteCellOpts(cell.FgColor(fg)))
 		w.Write(display, text.WriteCellOpts(cell.FgColor(fg)))
 		w.Write(valStr+"\n", text.WriteCellOpts(cell.FgColor(cell.ColorGreen)))
+	}
+
+	if end < len(filtered) {
+		w.Write(fmt.Sprintf("  ↓ %d more\n", len(filtered)-end), text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
 	}
 
 	if len(filtered) == 0 {
@@ -555,10 +881,10 @@ func run(targets []string) error {
 				}
 				ui.setKeys(keys)
 
-				filtered, selIdx, filter, filterMode := ui.snapshot()
-				dlog("ui: filtered=%d selIdx=%d filter=%q filterMode=%v", len(filtered), selIdx, filter, filterMode)
+				filtered, selIdx, scrollOff, filter, filterMode := ui.snapshot()
+				dlog("ui: filtered=%d selIdx=%d scrollOff=%d filter=%q filterMode=%v", len(filtered), selIdx, scrollOff, filter, filterMode)
 
-				renderMetricList(listWidget, st, filtered, selIdx, filter, filterMode)
+				renderMetricList(listWidget, st, filtered, selIdx, scrollOff, filter, filterMode)
 
 				selKey := ""
 				if selIdx >= 0 && selIdx < len(filtered) {
@@ -567,7 +893,16 @@ func run(targets []string) error {
 				dlog("selKey=%q prevSelKey=%q", selKey, prevSelKey)
 
 				if selKey != prevSelKey {
-					newChart, chartErr := linechart.New(linechart.YAxisAdaptive())
+					selSeries := st.get(selKey)
+					chartOpts := []linechart.Option{linechart.YAxisAdaptive()}
+					if selSeries != nil {
+						if selSeries.isCounter() {
+							chartOpts = append(chartOpts, linechart.YAxisFormattedValues(rateAxisFormatter()))
+						} else {
+							chartOpts = append(chartOpts, linechart.YAxisFormattedValues(yAxisFormatter(selSeries.name)))
+						}
+					}
+					newChart, chartErr := linechart.New(chartOpts...)
 					if chartErr == nil {
 						chart = newChart
 					} else {
@@ -578,8 +913,13 @@ func run(targets []string) error {
 
 				sel := st.get(selKey)
 				if sel != nil {
-					data := sel.slice()
-					dlog("sel=%s dataLen=%d", sel.displayName(), len(data))
+					var data []float64
+					if sel.isCounter() {
+						data = sel.rateSlice(rateWindowGet())
+					} else {
+						data = sel.slice()
+					}
+					dlog("sel=%s dataLen=%d counter=%v", sel.displayName(), len(data), sel.isCounter())
 					if len(data) >= 2 {
 						if seriesErr := chart.Series(sel.displayName(), data,
 							linechart.SeriesCellOpts(cell.FgColor(cell.ColorCyan)),
@@ -591,15 +931,20 @@ func run(targets []string) error {
 
 				chartTitle := " chart "
 				if sel != nil {
-					chartTitle = fmt.Sprintf(" %s ", sel.displayName())
+					if sel.isCounter() {
+						chartTitle = fmt.Sprintf(" %s [rate/s] ", sel.displayName())
+					} else {
+						chartTitle = fmt.Sprintf(" %s%s ", sel.displayName(), unitSuffix(sel.name))
+					}
 				}
 
 				statusWidget.Reset()
 				statusWidget.Write(fmt.Sprintf(
-					" madVisor %s │ Targets: %s │ Series: %d/%d │ Q/ESC: quit │ /: filter │ ↑↓: navigate",
+					" madVisor %s │ Targets: %s │ Series: %d/%d │ Rate: %s │ Q/ESC: quit │ /: filter │ ↑↓: nav │ []: rate",
 					version,
 					strings.Join(targets, ", "),
 					len(filtered), len(allSeries),
+					rateWindowGet(),
 				), text.WriteCellOpts(cell.FgColor(cell.ColorGreen)))
 
 				builder := grid.New()
@@ -638,7 +983,7 @@ func run(targets []string) error {
 
 	err = termdash.Run(ctx, t, c,
 		termdash.KeyboardSubscriber(func(k *terminalapi.Keyboard) {
-			_, _, _, filterMode := ui.snapshot()
+			_, _, _, _, filterMode := ui.snapshot()
 
 			if filterMode {
 				switch k.Key {
@@ -660,7 +1005,7 @@ func run(targets []string) error {
 
 			switch k.Key {
 			case keyboard.KeyEsc:
-				_, _, f, _ := ui.snapshot()
+				_, _, _, f, _ := ui.snapshot()
 				if f != "" {
 					ui.clearFilter()
 				} else {
@@ -674,6 +1019,10 @@ func run(targets []string) error {
 				ui.moveDown()
 			case keyboard.Key('/'):
 				ui.startFilter()
+			case keyboard.Key(']'), keyboard.Key('+'):
+				rateWindowUp()
+			case keyboard.Key('['), keyboard.Key('-'):
+				rateWindowDown()
 			}
 		}),
 		termdash.RedrawInterval(refreshInterval),
@@ -697,10 +1046,22 @@ func parseTargets() []string {
 	return targets
 }
 
+func parseRateWindow() {
+	if env := os.Getenv("RATE_WINDOW"); env != "" {
+		d, err := time.ParseDuration(env)
+		if err == nil && d > 0 {
+			rateWindowSet(d)
+		} else {
+			log.Printf("madvisor: invalid RATE_WINDOW %q, using default %s", env, defaultRateWindow)
+		}
+	}
+}
+
 func main() {
 	targets := parseTargets()
+	parseRateWindow()
 	log.Printf("madvisor %s (commit=%s branch=%s)", version, commit, branch)
-	log.Printf("madvisor: targets=%v", targets)
+	log.Printf("madvisor: targets=%v rateWindow=%s", targets, rateWindowGet())
 
 	waitForTTY()
 
