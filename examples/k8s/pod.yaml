@@ -7,7 +7,7 @@ metadata:
 spec:
   containers:
     - name: dummy-app
-      image: daxroc/madvisor-dummy:latest
+      image: dcroche/madvisor-dummy:latest
       imagePullPolicy: IfNotPresent
       ports:
         - containerPort: 8080
@@ -27,7 +27,7 @@ spec:
         periodSeconds: 5
 
     - name: madvisor
-      image: daxroc/madvisor:latest
+      image: dcroche/madvisor:latest
       imagePullPolicy: IfNotPresent
       stdin: true
       tty: true
