@@ -1,0 +1,25 @@
+services:
+  dummy-app:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile.madvisor-dummy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  madvisor:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile.madvisor
+    environment:
+      - METRIC_TARGETS=dummy-app:8080
+      - TERM=xterm-256color
+    stdin_open: true
+    tty: true
+    depends_on:
+      dummy-app:
+        condition: service_healthy

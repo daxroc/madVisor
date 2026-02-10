@@ -1,0 +1,26 @@
+# Binaries
+bin/
+/madvisor
+/madvisor-dummy
+/dummy-app
+/metric-viz
+*.exe
+
+# Debug logs
+/tmp/madvisor-debug.log
+
+# Go
+*.test
+*.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
