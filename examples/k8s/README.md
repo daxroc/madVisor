@@ -37,4 +37,4 @@ Use `inject-sidecar.sh` to add madVisor as an ephemeral debug container to any r
 
 - Kubernetes 1.25+ (ephemeral containers support)
 - `kubectl` configured with appropriate RBAC permissions
-- The `daxroc/madvisor:latest` image available to the cluster
+- The `dcroche/madvisor:latest` image available to the cluster

@@ -1,9 +1,10 @@
 MODULE     := github.com/daxroc/madVisor
-IMAGE_REPO ?= daxroc/madvisor
+IMAGE_REPO ?= dcroche/madvisor
 VERSION    := $(strip $(shell cat VERSION))
 GIT_COMMIT := $(or $(strip $(shell git rev-parse --short HEAD 2>/dev/null)),unknown)
 GIT_BRANCH := $(or $(strip $(shell git symbolic-ref --short HEAD 2>/dev/null)),unknown)
 TAG        ?= $(VERSION)
+PLATFORMS  ?= linux/amd64,linux/arm64
 
 LDFLAGS := -s -w \
 	-X 'main.version=$(VERSION)' \
@@ -12,7 +13,7 @@ LDFLAGS := -s -w \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test test-v run-local run-dummy run-viz docker-build deploy undeploy clean version
+.PHONY: help build test test-v run-local run-dummy run-viz docker-build docker-release deploy undeploy clean version
 
 help: ## Show this help
 	@printf "\n\033[1mmadVisor\033[0m — real-time pod metric visualizer\n\n"
@@ -51,7 +52,7 @@ run-local: ## Start dummy + madVisor together
 	@echo "Cleaning up..."
 	@-pkill -f "madvisor-dummy" 2>/dev/null || true
 
-docker-build: ## Build Docker images
+docker-build: ## Build Docker images (local arch only)
 	docker build -f docker/Dockerfile.madvisor-dummy \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
@@ -64,6 +65,24 @@ docker-build: ## Build Docker images
 		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
 		-t $(IMAGE_REPO):$(TAG) \
 		-t $(IMAGE_REPO):latest .
+
+docker-release: ## Build and push multi-arch images (amd64 + arm64)
+	docker buildx build -f docker/Dockerfile.madvisor-dummy \
+		--platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
+		-t $(IMAGE_REPO)-dummy:$(TAG) \
+		-t $(IMAGE_REPO)-dummy:latest \
+		--push .
+	docker buildx build -f docker/Dockerfile.madvisor \
+		--platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg GIT_BRANCH=$(GIT_BRANCH) \
+		-t $(IMAGE_REPO):$(TAG) \
+		-t $(IMAGE_REPO):latest \
+		--push .
 
 deploy: docker-build ## Build images and deploy to Kubernetes
 	kubectl apply -f examples/k8s/pod.yaml

@@ -12,7 +12,7 @@ Arguments:
   namespace       Kubernetes namespace (default: current context namespace)
 
 Environment:
-  MADVISOR_IMAGE  Override the madVisor image (default: daxroc/madvisor:latest)
+  MADVISOR_IMAGE  Override the madVisor image (default: dcroche/madvisor:latest)
 
 Examples:
   $0 my-app
@@ -24,7 +24,7 @@ POD_NAME="${1:?$USAGE}"
 METRIC_PORTS="${2:-8080}"
 NAMESPACE="${3:-}"
 
-IMAGE="${MADVISOR_IMAGE:-daxroc/madvisor:latest}"
+IMAGE="${MADVISOR_IMAGE:-dcroche/madvisor:latest}"
 
 # Build comma-separated localhost:port targets
 TARGETS=""

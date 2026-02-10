@@ -21,6 +21,7 @@ jobs:
     name: Container Image Scan
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       security-events: write
       contents: read
     steps:
@@ -59,13 +60,13 @@ jobs:
           output: trivy-dummy.sarif
 
       - name: Upload SARIF — madvisor
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-madvisor.sarif
           category: trivy-madvisor
 
       - name: Upload SARIF — madvisor-dummy
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-dummy.sarif
           category: trivy-madvisor-dummy
