@@ -288,7 +288,7 @@ func TestParseTargets(t *testing.T) {
 	os.Setenv("METRIC_TARGETS", "host1:8080,host2:9090")
 	defer os.Unsetenv("METRIC_TARGETS")
 
-	got := parseTargets()
+	got := parseTargets("")
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2", len(got))
 	}
@@ -300,7 +300,7 @@ func TestParseTargets(t *testing.T) {
 func TestParseTargetsDefault(t *testing.T) {
 	os.Unsetenv("METRIC_TARGETS")
 
-	got := parseTargets()
+	got := parseTargets("")
 	if len(got) != 1 || got[0] != "localhost:8080" {
 		t.Errorf("parseTargets() default = %v, want [localhost:8080]", got)
 	}
@@ -310,7 +310,7 @@ func TestParseTargetsTrimsWhitespace(t *testing.T) {
 	os.Setenv("METRIC_TARGETS", " host1:8080 , host2:9090 ")
 	defer os.Unsetenv("METRIC_TARGETS")
 
-	got := parseTargets()
+	got := parseTargets("")
 	if len(got) != 2 || got[0] != "host1:8080" || got[1] != "host2:9090" {
 		t.Errorf("parseTargets() = %v", got)
 	}
@@ -320,9 +320,28 @@ func TestParseTargetsSkipsEmpty(t *testing.T) {
 	os.Setenv("METRIC_TARGETS", "host1:8080,,host2:9090,")
 	defer os.Unsetenv("METRIC_TARGETS")
 
-	got := parseTargets()
+	got := parseTargets("")
 	if len(got) != 2 {
 		t.Errorf("parseTargets() len = %d, want 2 (skip empties)", len(got))
+	}
+}
+
+func TestParseTargetsFlagOverridesEnv(t *testing.T) {
+	os.Setenv("METRIC_TARGETS", "envhost:8080")
+	defer os.Unsetenv("METRIC_TARGETS")
+
+	got := parseTargets("flaghost:9090")
+	if len(got) != 1 || got[0] != "flaghost:9090" {
+		t.Errorf("parseTargets(flag) = %v, want [flaghost:9090]", got)
+	}
+}
+
+func TestParseTargetsFlagOnly(t *testing.T) {
+	os.Unsetenv("METRIC_TARGETS")
+
+	got := parseTargets("a:1,b:2")
+	if len(got) != 2 || got[0] != "a:1" || got[1] != "b:2" {
+		t.Errorf("parseTargets(flag) = %v, want [a:1 b:2]", got)
 	}
 }
 
@@ -994,16 +1013,48 @@ func TestParseRateWindow(t *testing.T) {
 
 	os.Setenv("RATE_WINDOW", "10s")
 	defer os.Unsetenv("RATE_WINDOW")
-	parseRateWindow()
+	parseRateWindow("")
 	if got := rateWindowGet(); got != 10*time.Second {
 		t.Errorf("rateWindow = %s, want 10s", got)
 	}
 
 	os.Setenv("RATE_WINDOW", "invalid")
 	rateWindowSet(defaultRateWindow)
-	parseRateWindow()
+	parseRateWindow("")
 	if got := rateWindowGet(); got != defaultRateWindow {
 		t.Errorf("rateWindow = %s, want default %s on invalid input", got, defaultRateWindow)
+	}
+}
+
+func TestParseRateWindowFlagOverridesEnv(t *testing.T) {
+	defer rateWindowSet(defaultRateWindow)
+
+	os.Setenv("RATE_WINDOW", "10s")
+	defer os.Unsetenv("RATE_WINDOW")
+
+	parseRateWindow("30s")
+	if got := rateWindowGet(); got != 30*time.Second {
+		t.Errorf("rateWindow = %s, want 30s (flag should override env)", got)
+	}
+}
+
+func TestParseRateWindowFlagOnly(t *testing.T) {
+	defer rateWindowSet(defaultRateWindow)
+	os.Unsetenv("RATE_WINDOW")
+
+	parseRateWindow("15s")
+	if got := rateWindowGet(); got != 15*time.Second {
+		t.Errorf("rateWindow = %s, want 15s", got)
+	}
+}
+
+func TestParseRateWindowFlagInvalid(t *testing.T) {
+	defer rateWindowSet(defaultRateWindow)
+	os.Unsetenv("RATE_WINDOW")
+
+	parseRateWindow("notaduration")
+	if got := rateWindowGet(); got != defaultRateWindow {
+		t.Errorf("rateWindow = %s, want default %s on invalid flag", got, defaultRateWindow)
 	}
 }
 

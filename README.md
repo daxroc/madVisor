@@ -89,10 +89,23 @@ kubectl delete -f examples/k8s/pod.yaml
 
 ## Configuration
 
+### CLI Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--targets` | `localhost:8080` | Comma-separated `host:port` list of Prometheus endpoints to scrape |
+| `--rate-window` | `5s` | Rate calculation window duration (e.g. `10s`, `30s`) |
+| `--version` | | Print version and exit |
+
+### Environment Variables
+
 | Env Var | Default | Description |
 |---|---|---|
 | `METRIC_TARGETS` | `localhost:8080` | Comma-separated `host:port` list of Prometheus endpoints to scrape |
+| `RATE_WINDOW` | `5s` | Rate calculation window duration |
 | `TERM` | `xterm-256color` | Terminal type for color support |
+
+CLI flags take precedence over environment variables.
 
 ## How It Works
 
