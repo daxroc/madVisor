@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -34,9 +35,9 @@ var (
 )
 
 const (
-	ringSize         = 120
-	scrapeInterval   = 1 * time.Second
-	refreshInterval  = 250 * time.Millisecond
+	ringSize          = 120
+	scrapeInterval    = 1 * time.Second
+	refreshInterval   = 250 * time.Millisecond
 	defaultRateWindow = 5 * time.Second
 )
 
@@ -1030,12 +1031,21 @@ func run(targets []string) error {
 	return err
 }
 
-func parseTargets() []string {
-	env := os.Getenv("METRIC_TARGETS")
-	if env == "" {
-		env = "localhost:8080"
+var (
+	flagTargets    = flag.String("targets", "", "comma-separated host:port list of Prometheus endpoints (env: METRIC_TARGETS)")
+	flagRateWindow = flag.String("rate-window", "", "rate calculation window duration, e.g. 10s (env: RATE_WINDOW)")
+	flagVersion    = flag.Bool("version", false, "print version and exit")
+)
+
+func parseTargets(flagVal string) []string {
+	val := flagVal
+	if val == "" {
+		val = os.Getenv("METRIC_TARGETS")
 	}
-	parts := strings.Split(env, ",")
+	if val == "" {
+		val = "localhost:8080"
+	}
+	parts := strings.Split(val, ",")
 	var targets []string
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
@@ -1046,20 +1056,31 @@ func parseTargets() []string {
 	return targets
 }
 
-func parseRateWindow() {
-	if env := os.Getenv("RATE_WINDOW"); env != "" {
-		d, err := time.ParseDuration(env)
+func parseRateWindow(flagVal string) {
+	val := flagVal
+	if val == "" {
+		val = os.Getenv("RATE_WINDOW")
+	}
+	if val != "" {
+		d, err := time.ParseDuration(val)
 		if err == nil && d > 0 {
 			rateWindowSet(d)
 		} else {
-			log.Printf("madvisor: invalid RATE_WINDOW %q, using default %s", env, defaultRateWindow)
+			log.Printf("madvisor: invalid rate-window %q, using default %s", val, defaultRateWindow)
 		}
 	}
 }
 
 func main() {
-	targets := parseTargets()
-	parseRateWindow()
+	flag.Parse()
+
+	if *flagVersion {
+		fmt.Printf("madvisor %s (commit=%s branch=%s)\n", version, commit, branch)
+		os.Exit(0)
+	}
+
+	targets := parseTargets(*flagTargets)
+	parseRateWindow(*flagRateWindow)
 	log.Printf("madvisor %s (commit=%s branch=%s)", version, commit, branch)
 	log.Printf("madvisor: targets=%v rateWindow=%s", targets, rateWindowGet())
 
