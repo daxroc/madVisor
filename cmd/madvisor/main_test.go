@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	if err := initPatterns(""); err != nil {
+		panic("failed to init patterns: " + err.Error())
+	}
+	os.Exit(m.Run())
+}
+
 // --- metricSeries tests ---
 
 func newTestSeries(name string, labels map[string]string) *metricSeries {
@@ -725,8 +732,6 @@ func TestFormatValueDispatch(t *testing.T) {
 		want string
 	}{
 		{"memory_usage_bytes", 1048576, "1.00 MiB"},
-		{"memory_usage_megabytes", 256, "256.00 MiB"},
-		{"memory_usage_kilobytes", 1024, "1.00 MiB"},
 		{"request_duration_seconds", 0.045, "45.0ms"},
 		{"request_duration_milliseconds", 45, "45.0ms"},
 		{"request_duration_ms", 45, "45.0ms"},
@@ -738,6 +743,50 @@ func TestFormatValueDispatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := formatValue(tt.name, tt.val); got != tt.want {
 				t.Errorf("formatValue(%q, %f) = %q, want %q", tt.name, tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatTimestamp(t *testing.T) {
+	if got := formatTimestamp(0); got != "0" {
+		t.Errorf("formatTimestamp(0) = %q, want \"0\"", got)
+	}
+
+	nowTs := float64(time.Now().Unix())
+	got := formatTimestamp(nowTs)
+	if !strings.HasSuffix(got, " ago") {
+		t.Errorf("formatTimestamp(now) = %q, want suffix \" ago\"", got)
+	}
+
+	pastTs := float64(time.Now().Add(-3 * time.Hour).Unix())
+	got = formatTimestamp(pastTs)
+	if !strings.Contains(got, "3h") || !strings.HasSuffix(got, " ago") {
+		t.Errorf("formatTimestamp(3h ago) = %q, want '3h0m ago'", got)
+	}
+
+	futureTs := float64(time.Now().Add(2 * time.Hour).Unix())
+	got = formatTimestamp(futureTs)
+	if !strings.HasPrefix(got, "in ") {
+		t.Errorf("formatTimestamp(future) = %q, want prefix \"in \"", got)
+	}
+}
+
+func TestFormatRelDuration(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{5 * time.Second, "5s"},
+		{90 * time.Second, "1m30s"},
+		{2*time.Hour + 15*time.Minute, "2h15m"},
+		{3*24*time.Hour + 4*time.Hour, "3d4h"},
+		{400 * 24 * time.Hour, "1y35d"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := formatRelDuration(tt.d); got != tt.want {
+				t.Errorf("formatRelDuration(%s) = %q, want %q", tt.d, got, tt.want)
 			}
 		})
 	}
@@ -768,13 +817,12 @@ func TestUnitSuffix(t *testing.T) {
 		want string
 	}{
 		{"memory_usage_bytes", " [bytes]"},
-		{"memory_usage_megabytes", " [bytes]"},
-		{"memory_usage_kilobytes", " [bytes]"},
 		{"request_duration_seconds", " [duration]"},
 		{"request_duration_milliseconds", " [duration]"},
 		{"latency_ms", " [duration]"},
 		{"cpu_usage_percent", " [%]"},
 		{"http_requests_total", " [count]"},
+		{"process_start_timestamp", " [time]"},
 		{"active_connections", ""},
 	}
 	for _, tt := range tests {
@@ -795,8 +843,8 @@ func TestIsCounter(t *testing.T) {
 		want  bool
 	}{
 		{"http_requests_total", "counter", true},
-		{"http_requests_total", "gauge", true},
-		{"http_requests_total", "", true},
+		{"http_requests_total", "gauge", false},
+		{"http_requests_total", "", false},
 		{"some_metric", "counter", true},
 		{"some_metric", "gauge", false},
 		{"memory_bytes", "", false},
@@ -1065,5 +1113,260 @@ func TestScrapeTargetHandlesError(t *testing.T) {
 
 	if len(st.snapshot()) != 0 {
 		t.Error("scrapeTarget should not populate store on connection error")
+	}
+}
+
+// --- detectMetricType tests ---
+
+func TestDetectMetricType(t *testing.T) {
+	tests := []struct {
+		name  string
+		mtype string
+		want  string
+	}{
+		{"http_requests_total", "counter", "counter"},
+		{"http_requests_total", "gauge", "gauge"},
+		{"http_requests_total", "", "gauge"},
+		{"request_duration_bucket", "histogram", "histogram"},
+		{"request_duration_bucket", "", "gauge"},
+		{"some_metric", "", "gauge"},
+		{"some_metric", "summary", "summary"},
+		{"go_gc_duration_seconds", "summary", "summary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+"_"+tt.mtype, func(t *testing.T) {
+			got := detectMetricType(tt.name, tt.mtype)
+			if got != tt.want {
+				t.Errorf("detectMetricType(%q, %q) = %q, want %q", tt.name, tt.mtype, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetricTypeBadge(t *testing.T) {
+	tests := []struct {
+		mtype string
+		want  string
+	}{
+		{"counter", "[C]"},
+		{"gauge", "[G]"},
+		{"histogram", "[H]"},
+		{"summary", "[S]"},
+		{"unknown", "[?]"},
+		{"", "[?]"},
+	}
+	for _, tt := range tests {
+		if got := metricTypeBadge(tt.mtype); got != tt.want {
+			t.Errorf("metricTypeBadge(%q) = %q, want %q", tt.mtype, got, tt.want)
+		}
+	}
+}
+
+func TestShouldRate(t *testing.T) {
+	tests := []struct {
+		name  string
+		mtype string
+		want  bool
+	}{
+		{"http_requests_total", "counter", true},
+		{"http_requests_total", "", false},
+		{"request_duration_count", "histogram", true},
+		{"request_duration_sum", "histogram", true},
+		{"request_duration_bucket", "histogram", false},
+		{"go_gc_duration_seconds_count", "summary", true},
+		{"go_gc_duration_seconds_sum", "summary", true},
+		{"memory_bytes", "", false},
+		{"some_metric", "gauge", false},
+	}
+	for _, tt := range tests {
+		s := &metricSeries{name: tt.name, mtype: tt.mtype, values: make([]float64, ringSize), times: make([]time.Time, ringSize)}
+		if got := s.shouldRate(); got != tt.want {
+			t.Errorf("shouldRate(name=%q, mtype=%q) = %v, want %v", tt.name, tt.mtype, got, tt.want)
+		}
+	}
+}
+
+// --- store name-grouping tests ---
+
+func TestStoreNames(t *testing.T) {
+	st := newStore()
+	st.update("cpu_usage", map[string]string{"env": "prod"}, "", "gauge", 1.0)
+	st.update("cpu_usage", map[string]string{"env": "staging"}, "", "gauge", 2.0)
+	st.update("http_requests_total", nil, "", "counter", 10.0)
+
+	names := st.names()
+	if len(names) != 2 {
+		t.Fatalf("names len = %d, want 2", len(names))
+	}
+	if names[0] != "cpu_usage" || names[1] != "http_requests_total" {
+		t.Errorf("names = %v, want [cpu_usage http_requests_total]", names)
+	}
+}
+
+func TestStoreSeriesForName(t *testing.T) {
+	st := newStore()
+	st.update("cpu", map[string]string{"env": "a"}, "", "", 1.0)
+	st.update("cpu", map[string]string{"env": "b"}, "", "", 2.0)
+	st.update("mem", nil, "", "", 3.0)
+
+	cpuSeries := st.seriesForName("cpu")
+	if len(cpuSeries) != 2 {
+		t.Errorf("seriesForName(cpu) = %d, want 2", len(cpuSeries))
+	}
+	memSeries := st.seriesForName("mem")
+	if len(memSeries) != 1 {
+		t.Errorf("seriesForName(mem) = %d, want 1", len(memSeries))
+	}
+}
+
+func TestStoreSeriesCount(t *testing.T) {
+	st := newStore()
+	st.update("m", map[string]string{"a": "1"}, "", "", 1)
+	st.update("m", map[string]string{"a": "2"}, "", "", 2)
+	st.update("m", map[string]string{"a": "3"}, "", "", 3)
+
+	if got := st.seriesCount("m"); got != 3 {
+		t.Errorf("seriesCount = %d, want 3", got)
+	}
+	if got := st.seriesCount("nonexistent"); got != 0 {
+		t.Errorf("seriesCount(nonexistent) = %d, want 0", got)
+	}
+}
+
+func TestStoreFirstType(t *testing.T) {
+	st := newStore()
+	st.update("http_requests_total", nil, "", "counter", 1)
+
+	if got := st.firstType("http_requests_total"); got != "counter" {
+		t.Errorf("firstType = %q, want counter", got)
+	}
+	if got := st.firstType("nonexistent"); got != "gauge" {
+		t.Errorf("firstType(nonexistent) = %q, want gauge", got)
+	}
+}
+
+// --- regex filter tests ---
+
+func TestUIStateRegexFilter(t *testing.T) {
+	u := &uiState{}
+	u.setKeys([]string{"cpu_usage", "cpu_idle", "memory_bytes", "http_requests_total"})
+
+	u.startFilter()
+	u.addFilterChar('c')
+	u.addFilterChar('p')
+	u.addFilterChar('u')
+	u.addFilterChar('_')
+	u.addFilterChar('.')
+
+	filtered, _, _, _, _ := u.snapshot()
+	_, _, _, regexOK := u.seriesSnapshot()
+	if !regexOK {
+		t.Error("regex should be valid for 'cpu_.'")
+	}
+	if len(filtered) != 2 {
+		t.Errorf("filtered = %d, want 2 (cpu_usage, cpu_idle)", len(filtered))
+	}
+}
+
+func TestUIStateRegexFilterInvalid(t *testing.T) {
+	u := &uiState{}
+	u.setKeys([]string{"abc", "def"})
+
+	u.startFilter()
+	u.addFilterChar('[')
+
+	_, _, _, regexOK := u.seriesSnapshot()
+	if regexOK {
+		t.Error("regex should be invalid for '['")
+	}
+	filtered, _, _, _, _ := u.snapshot()
+	if len(filtered) != 0 {
+		t.Errorf("filtered = %d, want 0 (literal '[' matches nothing)", len(filtered))
+	}
+}
+
+func TestUIStateRegexFilterCaret(t *testing.T) {
+	u := &uiState{}
+	u.setKeys([]string{"cpu_usage", "memory_bytes", "cpu_idle"})
+
+	u.startFilter()
+	u.addFilterChar('^')
+	u.addFilterChar('c')
+	u.addFilterChar('p')
+	u.addFilterChar('u')
+
+	filtered, _, _, _, _ := u.snapshot()
+	if len(filtered) != 2 {
+		t.Errorf("filtered = %d, want 2 (^cpu matches cpu_usage, cpu_idle)", len(filtered))
+	}
+}
+
+// --- focus and series navigation tests ---
+
+func TestUIStateToggleFocus(t *testing.T) {
+	u := &uiState{}
+	u.setKeys([]string{"a", "b"})
+
+	_, _, focus, _ := u.seriesSnapshot()
+	if focus != focusSidebar {
+		t.Error("initial focus should be sidebar")
+	}
+
+	u.toggleFocus()
+	_, _, focus, _ = u.seriesSnapshot()
+	if focus != focusSeriesTable {
+		t.Error("after toggle, focus should be seriesTable")
+	}
+
+	u.toggleFocus()
+	_, _, focus, _ = u.seriesSnapshot()
+	if focus != focusSidebar {
+		t.Error("after second toggle, focus should be sidebar")
+	}
+}
+
+func TestUIStateSeriesNavigation(t *testing.T) {
+	u := &uiState{}
+	u.setKeys([]string{"a", "b"})
+	u.toggleFocus()
+
+	u.moveDown()
+	u.moveDown()
+	u.moveDown()
+	seriesIdx, _, _, _ := u.seriesSnapshot()
+	if seriesIdx != 3 {
+		t.Errorf("seriesIdx = %d, want 3 after 3 moveDown in seriesTable", seriesIdx)
+	}
+
+	u.clampSeriesIdx(2)
+	seriesIdx, _, _, _ = u.seriesSnapshot()
+	if seriesIdx != 1 {
+		t.Errorf("seriesIdx after clamp(2) = %d, want 1", seriesIdx)
+	}
+
+	u.moveUp()
+	seriesIdx, _, _, _ = u.seriesSnapshot()
+	if seriesIdx != 0 {
+		t.Errorf("seriesIdx after moveUp = %d, want 0", seriesIdx)
+	}
+}
+
+func TestUIStateSidebarNavResetsSeries(t *testing.T) {
+	u := &uiState{}
+	u.setKeys([]string{"a", "b", "c"})
+
+	u.toggleFocus()
+	u.moveDown()
+	u.moveDown()
+	seriesIdx, _, _, _ := u.seriesSnapshot()
+	if seriesIdx != 2 {
+		t.Fatalf("seriesIdx = %d, want 2", seriesIdx)
+	}
+
+	u.toggleFocus()
+	u.moveDown()
+	seriesIdx, _, _, _ = u.seriesSnapshot()
+	if seriesIdx != 0 {
+		t.Errorf("seriesIdx should reset to 0 when navigating sidebar, got %d", seriesIdx)
 	}
 }

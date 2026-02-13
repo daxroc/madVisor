@@ -5,6 +5,7 @@ go 1.25.6
 require (
 	github.com/mum4k/termdash v0.20.0
 	golang.org/x/term v0.40.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
