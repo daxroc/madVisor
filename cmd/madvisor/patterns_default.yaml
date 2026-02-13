@@ -1,0 +1,36 @@
+units:
+  - unit: timestamp
+    suffix: " [time]"
+    matchers:
+      - "_time_seconds$"
+      - "_timestamp$"
+      - "_timestamp_seconds$"
+
+  - unit: bytes
+    suffix: " [bytes]"
+    matchers:
+      - "_bytes$"
+      - "_bytes_total$"
+
+  - unit: duration
+    suffix: " [duration]"
+    matchers:
+      - "_seconds$"
+      - "_seconds_total$"
+
+  - unit: duration_ms
+    suffix: " [duration]"
+    matchers:
+      - "_milliseconds$"
+      - "_ms$"
+
+  - unit: percent
+    suffix: " [%]"
+    matchers:
+      - "_percent$"
+      - "_ratio$"
+
+  - unit: count
+    suffix: " [count]"
+    matchers:
+      - "_total$"

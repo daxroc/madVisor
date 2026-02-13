@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,8 +140,60 @@ func (s *metricSeries) pushAt(v float64, t time.Time) {
 	}
 }
 
+func detectMetricType(name, mtype string) string {
+	if mtype != "" {
+		return mtype
+	}
+	return "gauge"
+}
+
+func metricTypeBadge(mtype string) string {
+	switch mtype {
+	case "counter":
+		return "[C]"
+	case "gauge":
+		return "[G]"
+	case "histogram":
+		return "[H]"
+	case "summary":
+		return "[S]"
+	default:
+		return "[?]"
+	}
+}
+
+func (s *metricSeries) detectedType() string {
+	return detectMetricType(s.name, s.mtype)
+}
+
 func (s *metricSeries) isCounter() bool {
-	return s.mtype == "counter" || strings.HasSuffix(s.name, "_total")
+	return s.detectedType() == "counter"
+}
+
+func matchUnit(name string) *UnitMatch {
+	if globalUnitMatcher != nil {
+		return globalUnitMatcher.Match(name)
+	}
+	return nil
+}
+
+func isTimestampMetric(name string) bool {
+	m := matchUnit(name)
+	return m != nil && m.Unit == "timestamp"
+}
+
+func (s *metricSeries) shouldRate() bool {
+	dt := s.detectedType()
+	if dt == "counter" {
+		return true
+	}
+	if dt == "summary" && (strings.HasSuffix(s.name, "_count") || strings.HasSuffix(s.name, "_sum")) {
+		return true
+	}
+	if dt == "histogram" && (strings.HasSuffix(s.name, "_count") || strings.HasSuffix(s.name, "_sum")) {
+		return true
+	}
+	return false
 }
 
 func (s *metricSeries) rate(window time.Duration) float64 {
@@ -266,20 +319,26 @@ func (s *metricSeries) displayName() string {
 // --- value formatting ---
 
 func formatValue(name string, v float64) string {
-	switch {
-	case strings.HasSuffix(name, "_bytes"):
+	m := matchUnit(name)
+	if m == nil {
+		return formatGeneric(v)
+	}
+	switch m.Unit {
+	case "bytes":
 		return formatBytes(v)
-	case strings.HasSuffix(name, "_megabytes"):
+	case "megabytes":
 		return formatBytes(v * 1024 * 1024)
-	case strings.HasSuffix(name, "_kilobytes"):
+	case "kilobytes":
 		return formatBytes(v * 1024)
-	case strings.HasSuffix(name, "_seconds"):
+	case "duration":
 		return formatDuration(v)
-	case strings.HasSuffix(name, "_milliseconds") || strings.HasSuffix(name, "_ms"):
+	case "duration_ms":
 		return formatDuration(v / 1000)
-	case strings.HasSuffix(name, "_percent"):
+	case "percent":
 		return fmt.Sprintf("%.1f%%", v)
-	case strings.HasSuffix(name, "_total"):
+	case "timestamp":
+		return formatTimestamp(v)
+	case "count":
 		return formatCount(v)
 	default:
 		return formatGeneric(v)
@@ -333,6 +392,44 @@ func formatCount(v float64) string {
 	}
 }
 
+func formatTimestamp(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	sec := int64(v)
+	nsec := int64((v - float64(sec)) * 1e9)
+	t := time.Unix(sec, nsec).UTC()
+	now := time.Now().UTC()
+	diff := now.Sub(t)
+
+	if diff < 0 {
+		return fmt.Sprintf("in %s", formatRelDuration(-diff))
+	}
+	return fmt.Sprintf("%s ago", formatRelDuration(diff))
+}
+
+func formatRelDuration(d time.Duration) string {
+	totalSec := int(d.Seconds())
+	if totalSec < 60 {
+		return fmt.Sprintf("%ds", totalSec)
+	}
+	totalMin := int(d.Minutes())
+	if totalMin < 60 {
+		return fmt.Sprintf("%dm%ds", totalMin, totalSec%60)
+	}
+	totalHr := int(d.Hours())
+	if totalHr < 24 {
+		return fmt.Sprintf("%dh%dm", totalHr, totalMin%60)
+	}
+	days := totalHr / 24
+	if days < 365 {
+		return fmt.Sprintf("%dd%dh", days, totalHr%24)
+	}
+	years := days / 365
+	remDays := days % 365
+	return fmt.Sprintf("%dy%dd", years, remDays)
+}
+
 func formatGeneric(v float64) string {
 	if v == 0 {
 		return "0"
@@ -374,34 +471,28 @@ func yAxisFormatter(metricName string) linechart.ValueFormatter {
 }
 
 func unitSuffix(name string) string {
-	switch {
-	case strings.HasSuffix(name, "_bytes"),
-		strings.HasSuffix(name, "_megabytes"),
-		strings.HasSuffix(name, "_kilobytes"):
-		return " [bytes]"
-	case strings.HasSuffix(name, "_seconds"):
-		return " [duration]"
-	case strings.HasSuffix(name, "_milliseconds") || strings.HasSuffix(name, "_ms"):
-		return " [duration]"
-	case strings.HasSuffix(name, "_percent"):
-		return " [%]"
-	case strings.HasSuffix(name, "_total"):
-		return " [count]"
-	default:
-		return ""
+	m := matchUnit(name)
+	if m != nil {
+		return m.Suffix
 	}
+	return ""
 }
 
 // --- store ---
 
 type store struct {
-	mu     sync.RWMutex
-	series map[string]*metricSeries
-	order  []string
+	mu          sync.RWMutex
+	series      map[string]*metricSeries
+	order       []string
+	metricNames []string
+	nameSet     map[string]bool
 }
 
 func newStore() *store {
-	return &store{series: make(map[string]*metricSeries)}
+	return &store{
+		series:  make(map[string]*metricSeries),
+		nameSet: make(map[string]bool),
+	}
 }
 
 func seriesKey(name string, labels map[string]string) string {
@@ -438,6 +529,11 @@ func (st *store) update(name string, labels map[string]string, help, mtype strin
 		st.series[key] = s
 		st.order = append(st.order, key)
 		sort.Strings(st.order)
+		if !st.nameSet[name] {
+			st.nameSet[name] = true
+			st.metricNames = append(st.metricNames, name)
+			sort.Strings(st.metricNames)
+		}
 	}
 	s.push(value)
 }
@@ -452,10 +548,53 @@ func (st *store) snapshot() []*metricSeries {
 	return out
 }
 
+func (st *store) names() []string {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return append([]string{}, st.metricNames...)
+}
+
+func (st *store) seriesForName(name string) []*metricSeries {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	var out []*metricSeries
+	for _, k := range st.order {
+		s := st.series[k]
+		if s.name == name {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (st *store) seriesCount(name string) int {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	count := 0
+	for _, k := range st.order {
+		if st.series[k].name == name {
+			count++
+		}
+	}
+	return count
+}
+
 func (st *store) get(key string) *metricSeries {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 	return st.series[key]
+}
+
+func (st *store) firstType(name string) string {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	for _, k := range st.order {
+		s := st.series[k]
+		if s.name == name {
+			return s.detectedType()
+		}
+	}
+	return "gauge"
 }
 
 // --- scraper ---
@@ -581,6 +720,13 @@ func waitForTTY() {
 
 const defaultPageSize = 30
 
+type focusPanel int
+
+const (
+	focusSidebar focusPanel = iota
+	focusSeriesTable
+)
+
 type uiState struct {
 	mu           sync.Mutex
 	allKeys      []string
@@ -590,11 +736,29 @@ type uiState struct {
 	pageSize     int
 	filterText   string
 	filterMode   bool
+	regexValid   bool
+
+	focus          focusPanel
+	seriesIdx      int
+	seriesScroll   int
+	seriesPageSize int
 }
 
 func (u *uiState) setKeys(keys []string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if len(keys) == len(u.allKeys) {
+		same := true
+		for i := range keys {
+			if keys[i] != u.allKeys[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return
+		}
+	}
 	u.allKeys = keys
 	u.applyFilter()
 }
@@ -602,12 +766,24 @@ func (u *uiState) setKeys(keys []string) {
 func (u *uiState) applyFilter() {
 	if u.filterText == "" {
 		u.filtered = append([]string{}, u.allKeys...)
+		u.regexValid = true
 	} else {
 		u.filtered = nil
-		lower := strings.ToLower(u.filterText)
-		for _, k := range u.allKeys {
-			if strings.Contains(strings.ToLower(k), lower) {
-				u.filtered = append(u.filtered, k)
+		re, err := regexp.Compile("(?i)" + u.filterText)
+		if err != nil {
+			u.regexValid = false
+			lower := strings.ToLower(u.filterText)
+			for _, k := range u.allKeys {
+				if strings.Contains(strings.ToLower(k), lower) {
+					u.filtered = append(u.filtered, k)
+				}
+			}
+		} else {
+			u.regexValid = true
+			for _, k := range u.allKeys {
+				if re.MatchString(k) {
+					u.filtered = append(u.filtered, k)
+				}
 			}
 		}
 	}
@@ -617,6 +793,9 @@ func (u *uiState) applyFilter() {
 	if u.selectedIdx < 0 {
 		u.selectedIdx = 0
 	}
+	u.scrollOffset = 0
+	u.seriesIdx = 0
+	u.seriesScroll = 0
 	u.adjustScroll()
 }
 
@@ -636,21 +815,64 @@ func (u *uiState) adjustScroll() {
 	}
 }
 
+func (u *uiState) adjustSeriesScroll() {
+	ps := u.seriesPageSize
+	if ps <= 0 {
+		ps = 10
+	}
+	if u.seriesIdx < u.seriesScroll {
+		u.seriesScroll = u.seriesIdx
+	}
+	if u.seriesIdx >= u.seriesScroll+ps {
+		u.seriesScroll = u.seriesIdx - ps + 1
+	}
+	if u.seriesScroll < 0 {
+		u.seriesScroll = 0
+	}
+}
+
 func (u *uiState) moveUp() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.selectedIdx > 0 {
-		u.selectedIdx--
-		u.adjustScroll()
+	if u.focus == focusSidebar {
+		if u.selectedIdx > 0 {
+			u.selectedIdx--
+			u.adjustScroll()
+			u.seriesIdx = 0
+			u.seriesScroll = 0
+		}
+	} else {
+		if u.seriesIdx > 0 {
+			u.seriesIdx--
+			u.adjustSeriesScroll()
+		}
 	}
 }
 
 func (u *uiState) moveDown() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.selectedIdx < len(u.filtered)-1 {
-		u.selectedIdx++
-		u.adjustScroll()
+	if u.focus == focusSidebar {
+		if u.selectedIdx < len(u.filtered)-1 {
+			u.selectedIdx++
+			u.adjustScroll()
+			u.seriesIdx = 0
+			u.seriesScroll = 0
+		}
+	} else {
+		u.seriesIdx++
+		u.adjustSeriesScroll()
+	}
+}
+
+func (u *uiState) clampSeriesIdx(max int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.seriesIdx >= max {
+		u.seriesIdx = max - 1
+	}
+	if u.seriesIdx < 0 {
+		u.seriesIdx = 0
 	}
 }
 
@@ -661,6 +883,16 @@ func (u *uiState) selectedKey() string {
 		return u.filtered[u.selectedIdx]
 	}
 	return ""
+}
+
+func (u *uiState) toggleFocus() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.focus == focusSidebar {
+		u.focus = focusSeriesTable
+	} else {
+		u.focus = focusSidebar
+	}
 }
 
 func (u *uiState) addFilterChar(ch rune) {
@@ -697,6 +929,12 @@ func (u *uiState) snapshot() (filtered []string, selIdx int, scrollOff int, filt
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return append([]string{}, u.filtered...), u.selectedIdx, u.scrollOffset, u.filterText, u.filterMode
+}
+
+func (u *uiState) seriesSnapshot() (seriesIdx int, seriesScroll int, focus focusPanel, regexOK bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.seriesIdx, u.seriesScroll, u.focus, u.regexValid
 }
 
 // --- colors ---
@@ -738,13 +976,17 @@ func buildSplashGrid(logoWidget *text.Text, statusWidget *text.Text) ([]containe
 	return builder.Build()
 }
 
-// --- render metric list ---
+// --- render metric name list (sidebar) ---
 
-func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, scrollOff int, filter string, filterMode bool) {
+func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, scrollOff int, filter string, filterMode bool, regexOK bool, focus focusPanel) {
 	w.Reset()
 
 	if filterMode || filter != "" {
-		w.Write("Filter: ", text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
+		w.Write("Filter", text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
+		if !regexOK {
+			w.Write("(err)", text.WriteCellOpts(cell.FgColor(cell.ColorRed)))
+		}
+		w.Write(": ", text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
 		w.Write(filter, text.WriteCellOpts(cell.FgColor(cell.ColorWhite)))
 		w.Write("█\n", text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
 		w.Write("\n")
@@ -760,29 +1002,32 @@ func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, sc
 	}
 
 	for i := scrollOff; i < end; i++ {
-		s := st.get(filtered[i])
-		if s == nil {
-			continue
-		}
+		name := filtered[i]
+		mtype := st.firstType(name)
+		count := st.seriesCount(name)
+
 		prefix := "  "
 		fg := cell.ColorWhite
 		if i == selIdx {
-			prefix = "▶ "
-			fg = cell.ColorCyan
+			if focus == focusSidebar {
+				prefix = "▶ "
+				fg = cell.ColorCyan
+			} else {
+				prefix = "› "
+				fg = cell.ColorBlue
+			}
 		}
 
-		display := s.displayName()
-		var valStr string
-		if s.isCounter() {
-			r := s.rate(rateWindowGet())
-			valStr = " = " + formatGeneric(r) + "/s"
-		} else {
-			valStr = " = " + formatValue(s.name, s.last())
+		badge := metricTypeBadge(mtype)
+		countStr := ""
+		if count > 1 {
+			countStr = fmt.Sprintf(" (%d)", count)
 		}
 
 		w.Write(prefix, text.WriteCellOpts(cell.FgColor(fg)))
-		w.Write(display, text.WriteCellOpts(cell.FgColor(fg)))
-		w.Write(valStr+"\n", text.WriteCellOpts(cell.FgColor(cell.ColorGreen)))
+		w.Write(badge+" ", text.WriteCellOpts(cell.FgColor(cell.ColorMagenta)))
+		w.Write(name, text.WriteCellOpts(cell.FgColor(fg)))
+		w.Write(countStr+"\n", text.WriteCellOpts(cell.FgColor(cell.ColorGreen)))
 	}
 
 	if end < len(filtered) {
@@ -791,6 +1036,91 @@ func renderMetricList(w *text.Text, st *store, filtered []string, selIdx int, sc
 
 	if len(filtered) == 0 {
 		w.Write("\n  no metrics match filter", text.WriteCellOpts(cell.FgColor(cell.ColorRed)))
+	}
+}
+
+// --- render series table ---
+
+func renderSeriesTable(w *text.Text, st *store, metricName string, seriesIdx int, seriesScroll int, focus focusPanel) {
+	w.Reset()
+
+	if metricName == "" {
+		w.Write("  select a metric name", text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
+		return
+	}
+
+	seriesList := st.seriesForName(metricName)
+	if len(seriesList) == 0 {
+		w.Write("  no series for "+metricName, text.WriteCellOpts(cell.FgColor(cell.ColorRed)))
+		return
+	}
+
+	mtype := st.firstType(metricName)
+	w.Write(fmt.Sprintf(" %s %s — %d series\n", metricTypeBadge(mtype), metricName, len(seriesList)),
+		text.WriteCellOpts(cell.FgColor(cell.ColorCyan)))
+
+	if seriesList[0].help != "" {
+		w.Write(" "+seriesList[0].help+"\n", text.WriteCellOpts(cell.FgColor(cell.ColorWhite)))
+	}
+	w.Write("\n")
+
+	pageSize := 10
+	end := len(seriesList)
+	if end > seriesScroll+pageSize {
+		end = seriesScroll + pageSize
+	}
+
+	if seriesScroll > 0 {
+		w.Write(fmt.Sprintf("  ↑ %d more\n", seriesScroll), text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
+	}
+
+	for i := seriesScroll; i < end; i++ {
+		s := seriesList[i]
+		prefix := "  "
+		fg := cell.ColorWhite
+		if i == seriesIdx && focus == focusSeriesTable {
+			prefix = "▶ "
+			fg = cell.ColorCyan
+		}
+
+		labelStr := ""
+		if len(s.labels) > 0 {
+			parts := make([]string, 0, len(s.labels))
+			keys := make([]string, 0, len(s.labels))
+			for k := range s.labels {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				parts = append(parts, fmt.Sprintf(`%s="%s"`, k, s.labels[k]))
+			}
+			labelStr = "{" + strings.Join(parts, ", ") + "}"
+		} else {
+			labelStr = "(no labels)"
+		}
+
+		raw := s.last()
+		rawStr := strconv.FormatFloat(raw, 'f', -1, 64)
+		var valStr string
+		if s.shouldRate() {
+			r := s.rate(rateWindowGet())
+			valStr = formatGeneric(r) + "/s"
+		} else {
+			valStr = formatValue(s.name, raw)
+		}
+
+		display := valStr
+		if valStr != rawStr {
+			display = valStr + " (" + rawStr + ")"
+		}
+
+		w.Write(prefix, text.WriteCellOpts(cell.FgColor(fg)))
+		w.Write(labelStr, text.WriteCellOpts(cell.FgColor(fg)))
+		w.Write(" = "+display+"\n", text.WriteCellOpts(cell.FgColor(cell.ColorGreen)))
+	}
+
+	if end < len(seriesList) {
+		w.Write(fmt.Sprintf("  ↓ %d more\n", len(seriesList)-end), text.WriteCellOpts(cell.FgColor(cell.ColorYellow)))
 	}
 }
 
@@ -860,7 +1190,13 @@ func run(targets []string) error {
 		return err
 	}
 
-	prevSelKey := ""
+	seriesWidget, err := text.New(text.WrapAtRunes())
+	if err != nil {
+		return err
+	}
+
+	prevSelName := ""
+	prevSeriesKey := ""
 
 	go func() {
 		ticker := time.NewTicker(refreshInterval)
@@ -870,37 +1206,60 @@ func run(targets []string) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				allSeries := st.snapshot()
-				dlog("tick: allSeries=%d", len(allSeries))
-				if len(allSeries) == 0 {
+				names := st.names()
+				dlog("tick: names=%d", len(names))
+				if len(names) == 0 {
 					continue
 				}
 
-				keys := make([]string, len(allSeries))
-				for i, s := range allSeries {
-					keys[i] = s.key
-				}
-				ui.setKeys(keys)
+				ui.setKeys(names)
 
 				filtered, selIdx, scrollOff, filter, filterMode := ui.snapshot()
-				dlog("ui: filtered=%d selIdx=%d scrollOff=%d filter=%q filterMode=%v", len(filtered), selIdx, scrollOff, filter, filterMode)
+				seriesIdx, seriesScroll, focus, regexOK := ui.seriesSnapshot()
+				dlog("ui: filtered=%d selIdx=%d scrollOff=%d filter=%q filterMode=%v focus=%d", len(filtered), selIdx, scrollOff, filter, filterMode, focus)
 
-				renderMetricList(listWidget, st, filtered, selIdx, scrollOff, filter, filterMode)
+				renderMetricList(listWidget, st, filtered, selIdx, scrollOff, filter, filterMode, regexOK, focus)
 
-				selKey := ""
+				selName := ""
 				if selIdx >= 0 && selIdx < len(filtered) {
-					selKey = filtered[selIdx]
+					selName = filtered[selIdx]
 				}
-				dlog("selKey=%q prevSelKey=%q", selKey, prevSelKey)
 
-				if selKey != prevSelKey {
-					selSeries := st.get(selKey)
+				seriesList := st.seriesForName(selName)
+				ui.clampSeriesIdx(len(seriesList))
+				seriesIdx, seriesScroll, focus, _ = ui.seriesSnapshot()
+
+				renderSeriesTable(seriesWidget, st, selName, seriesIdx, seriesScroll, focus)
+
+				var chartSeries []*metricSeries
+				if focus == focusSeriesTable && seriesIdx >= 0 && seriesIdx < len(seriesList) {
+					chartSeries = []*metricSeries{seriesList[seriesIdx]}
+				} else {
+					chartSeries = seriesList
+				}
+
+				chartKey := ""
+				if len(chartSeries) > 0 {
+					for _, cs := range chartSeries {
+						chartKey += cs.key + ";"
+					}
+				}
+
+				if chartKey != prevSeriesKey || selName != prevSelName {
 					chartOpts := []linechart.Option{linechart.YAxisAdaptive()}
-					if selSeries != nil {
-						if selSeries.isCounter() {
+					if len(chartSeries) > 0 {
+						first := chartSeries[0]
+						if first.shouldRate() {
 							chartOpts = append(chartOpts, linechart.YAxisFormattedValues(rateAxisFormatter()))
+						} else if isTimestampMetric(first.name) {
+							chartOpts = append(chartOpts, linechart.YAxisFormattedValues(func(v float64) string {
+								if math.IsNaN(v) {
+									return ""
+								}
+								return formatRelDuration(time.Duration(v * float64(time.Second)))
+							}))
 						} else {
-							chartOpts = append(chartOpts, linechart.YAxisFormattedValues(yAxisFormatter(selSeries.name)))
+							chartOpts = append(chartOpts, linechart.YAxisFormattedValues(yAxisFormatter(first.name)))
 						}
 					}
 					newChart, chartErr := linechart.New(chartOpts...)
@@ -909,21 +1268,30 @@ func run(targets []string) error {
 					} else {
 						dlog("chart create error: %v", chartErr)
 					}
-					prevSelKey = selKey
+					prevSelName = selName
+					prevSeriesKey = chartKey
 				}
 
-				sel := st.get(selKey)
-				if sel != nil {
+				for i, cs := range chartSeries {
 					var data []float64
-					if sel.isCounter() {
-						data = sel.rateSlice(rateWindowGet())
+					if cs.shouldRate() {
+						data = cs.rateSlice(rateWindowGet())
+					} else if isTimestampMetric(cs.name) {
+						nowSec := float64(time.Now().Unix())
+						raw := cs.slice()
+						data = make([]float64, len(raw))
+						for j, v := range raw {
+							if v > 0 {
+								data[j] = nowSec - v
+							}
+						}
 					} else {
-						data = sel.slice()
+						data = cs.slice()
 					}
-					dlog("sel=%s dataLen=%d counter=%v", sel.displayName(), len(data), sel.isCounter())
 					if len(data) >= 2 {
-						if seriesErr := chart.Series(sel.displayName(), data,
-							linechart.SeriesCellOpts(cell.FgColor(cell.ColorCyan)),
+						label := cs.displayName()
+						if seriesErr := chart.Series(label, data,
+							linechart.SeriesCellOpts(cell.FgColor(colorForIndex(i))),
 						); seriesErr != nil {
 							dlog("chart.Series error: %v", seriesErr)
 						}
@@ -931,37 +1299,66 @@ func run(targets []string) error {
 				}
 
 				chartTitle := " chart "
-				if sel != nil {
-					if sel.isCounter() {
-						chartTitle = fmt.Sprintf(" %s [rate/s] ", sel.displayName())
+				if selName != "" {
+					mtype := st.firstType(selName)
+					if focus == focusSeriesTable && len(chartSeries) == 1 {
+						cs := chartSeries[0]
+						if cs.shouldRate() {
+							chartTitle = fmt.Sprintf(" %s [rate/s] ", cs.displayName())
+						} else if isTimestampMetric(cs.name) {
+							chartTitle = fmt.Sprintf(" %s [age] ", cs.displayName())
+						} else {
+							chartTitle = fmt.Sprintf(" %s%s ", cs.displayName(), unitSuffix(cs.name))
+						}
 					} else {
-						chartTitle = fmt.Sprintf(" %s%s ", sel.displayName(), unitSuffix(sel.name))
+						chartTitle = fmt.Sprintf(" %s %s (%d series) ", metricTypeBadge(mtype), selName, len(seriesList))
 					}
 				}
 
+				sidebarBorderColor := cell.ColorGreen
+				seriesBorderColor := cell.ColorBlue
+				if focus == focusSidebar {
+					sidebarBorderColor = cell.ColorCyan
+					seriesBorderColor = cell.ColorBlue
+				} else {
+					sidebarBorderColor = cell.ColorGreen
+					seriesBorderColor = cell.ColorCyan
+				}
+
+				allSeries := st.snapshot()
 				statusWidget.Reset()
 				statusWidget.Write(fmt.Sprintf(
-					" madVisor %s │ Targets: %s │ Series: %d/%d │ Rate: %s │ Q/ESC: quit │ /: filter │ ↑↓: nav │ []: rate",
+					" madVisor %s │ Targets: %s │ Metrics: %d/%d │ Series: %d │ Rate: %s │ Q: quit │ /: filter │ Tab: focus │ ↑↓: nav │ []: rate",
 					version,
 					strings.Join(targets, ", "),
-					len(filtered), len(allSeries),
+					len(filtered), len(names),
+					len(allSeries),
 					rateWindowGet(),
 				), text.WriteCellOpts(cell.FgColor(cell.ColorGreen)))
 
 				builder := grid.New()
 				builder.Add(grid.RowHeightPerc(95,
 					grid.ColWidthPerc(70,
-						grid.Widget(chart,
-							container.Border(linestyle.Light),
-							container.BorderTitle(chartTitle),
-							container.BorderColor(cell.ColorCyan),
+						grid.RowHeightPerc(60,
+							grid.Widget(chart,
+								container.Border(linestyle.Light),
+								container.BorderTitle(chartTitle),
+								container.BorderColor(cell.ColorCyan),
+							),
+						),
+						grid.RowHeightPerc(39,
+							grid.Widget(seriesWidget,
+								container.Border(linestyle.Light),
+								container.BorderTitle(" series "),
+								container.BorderColor(seriesBorderColor),
+							),
 						),
 					),
 					grid.ColWidthPerc(29,
 						grid.Widget(listWidget,
 							container.Border(linestyle.Light),
-							container.BorderTitle(" metrics "),
-							container.BorderColor(cell.ColorGreen),
+							container.BorderTitle(" metric names "),
+							container.BorderColor(sidebarBorderColor),
 						),
 					),
 				))
@@ -1018,6 +1415,8 @@ func run(targets []string) error {
 				ui.moveUp()
 			case keyboard.KeyArrowDown, keyboard.Key('j'):
 				ui.moveDown()
+			case keyboard.KeyTab:
+				ui.toggleFocus()
 			case keyboard.Key('/'):
 				ui.startFilter()
 			case keyboard.Key(']'), keyboard.Key('+'):
@@ -1034,6 +1433,7 @@ func run(targets []string) error {
 var (
 	flagTargets    = flag.String("targets", "", "comma-separated host:port list of Prometheus endpoints (env: METRIC_TARGETS)")
 	flagRateWindow = flag.String("rate-window", "", "rate calculation window duration, e.g. 10s (env: RATE_WINDOW)")
+	flagPatterns   = flag.String("patterns", "", "path to custom metric patterns YAML file (overrides built-in defaults)")
 	flagVersion    = flag.Bool("version", false, "print version and exit")
 )
 
@@ -1077,6 +1477,10 @@ func main() {
 	if *flagVersion {
 		fmt.Printf("madvisor %s (commit=%s branch=%s)\n", version, commit, branch)
 		os.Exit(0)
+	}
+
+	if err := initPatterns(*flagPatterns); err != nil {
+		log.Fatalf("madvisor: %v", err)
 	}
 
 	targets := parseTargets(*flagTargets)
